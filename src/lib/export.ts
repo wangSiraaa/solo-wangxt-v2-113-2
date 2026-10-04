@@ -1,6 +1,7 @@
 import type { Project } from '../types';
 import { GROUP_SPECS, getCellSize, translationMatrix } from './groups';
 import { applyMat3, instanceMatrix } from './render';
+import { canonicalInstanceKey, cosetClassIndex } from './anchors';
 import { makePath2D, makePolygonPath, tracePath } from './path';
 
 export interface TileResult {
@@ -43,21 +44,31 @@ export function exportPeriodicTile(project: Project, scale = 2): TileResult {
 
   // A few extra neighboring primitive copies are needed only because some fundamental
   // domain coordinates (pm/pmg/cm) extend across the conventional rectangle's border.
+  // The window is kept asymmetric so that stabilizer-merged images (canonical coordinates
+  // may differ by a lattice translation) still have a representative copy rendered.
   const range = triangular
-    ? { nMin: -1, nMax: 2, mMin: -1, mMax: 2 }
-    : { nMin: -1, nMax: 1, mMin: -1, mMax: 1 };
+    ? { nMin: -2, nMax: 3, mMin: -2, mMax: 3 }
+    : { nMin: -2, nMax: 2, mMin: -2, mMax: 2 };
 
   for (const item of project.objects) {
     const path = makePath2D(item.path);
+    const { byCoset } = cosetClassIndex(project, item);
+    // 与画布同一套稳定子去重：锚在旋转中心/镜面的对称图元不会在导出 PNG 上叠色。
+    const seen = new Set<string>();
     for (let coset = 0; coset < cosetMatrices.length; coset += 1) {
       for (let n = range.nMin; n <= range.nMax; n += 1) {
         for (let m = range.mMin; m <= range.mMax; m += 1) {
+          const tn = n + (triangular ? 1 : 0);
+          const tm = m + (triangular ? 1 : 0);
+          const canonical = canonicalInstanceKey(byCoset, coset, tn, tm);
+          if (seen.has(canonical.key)) continue;
+          seen.add(canonical.key);
           ctx.save();
           // Translate into the positive rectangular supercell before clipping.
           const shift = translationMatrix(project.group, cellW, cellH, triangular ? 1 : 0, triangular ? 1 : 0);
           const matrix = shift;
           void matrix;
-          applyMat3(ctx, instanceMatrix(project, coset, n + (triangular ? 1 : 0), m + (triangular ? 1 : 0)));
+          applyMat3(ctx, instanceMatrix(project, canonical.coset, canonical.n, canonical.m));
           ctx.beginPath();
           ctx.rect(0, 0, width, height);
           ctx.clip();

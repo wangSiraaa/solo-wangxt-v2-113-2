@@ -12,6 +12,7 @@ import {
   translationMatrix
 } from './groups';
 import { makePath2D, makePolygonPath, tracePath } from './path';
+import { canonicalInstanceKey, cosetClassIndex } from './anchors';
 
 export interface InstanceKey {
   objectId: string;
@@ -362,10 +363,28 @@ export function drawScene(
 
   for (const item of project.objects) {
     const itemPath = makePath2D(item.path);
+    const { byCoset } = cosetClassIndex(project, item);
+    // 稳定子让若干陪集像彼此只差一个晶格平移；同一规范像只绘制一次，
+    // 避免旋转中心/镜面上的重合副本被反复填涂而变深。
+    const seen = new Set<string>();
+    const nList: number[] = [];
+    const mList: number[] = [];
+    for (let n = range.nMin; n <= range.nMax; n += 1) nList.push(n);
+    for (let m = range.mMin; m <= range.mMax; m += 1) mList.push(m);
+    const inRange = (n: number, m: number) =>
+      n >= range.nMin && n <= range.nMax && m >= range.mMin && m <= range.mMax;
     for (let coset = 0; coset < spec.cosets(w, h).length; coset += 1) {
-      for (let n = range.nMin; n <= range.nMax; n += 1) {
-        for (let m = range.mMin; m <= range.mMax; m += 1) {
-          const matrix = instanceMatrix(project, coset, n, m);
+      for (const n of nList) {
+        for (const m of mList) {
+          const canonical = canonicalInstanceKey(byCoset, coset, n, m);
+          if (seen.has(canonical.key)) continue;
+          seen.add(canonical.key);
+          // 被合并的像若其代表副本落在当前枚举范围之外（极端平移晶格下），
+          // 用当前成员位置画出这一份，保证屏幕上不缺画。
+          const drawN = inRange(canonical.n, canonical.m) ? canonical.n : n;
+          const drawM = inRange(canonical.n, canonical.m) ? canonical.m : m;
+          const drawCoset = inRange(canonical.n, canonical.m) ? canonical.coset : coset;
+          const matrix = instanceMatrix(project, drawCoset, drawN, drawM);
           ctx.save();
           applyMat3(ctx, matrix);
           ctx.clip(domainPath);
@@ -401,6 +420,11 @@ export function hitTest(
   const range = translationRange(project, camera, width, height, 1);
   const [w, h] = getCellSize(project.group, project.cellWidth, project.cellHeight);
   const spec = GROUP_SPECS[project.group];
+  // 已经报告过的规范实例：稳定子重合像共享同一身份，不再产生歧义命中。
+  const reported = new Set<string>();
+  const cosetIndices = new Map(
+    project.objects.map((item) => [item.id, cosetClassIndex(project, item).byCoset])
+  );
   // The editor tests a deliberately generous band because interactive canvases are usually
   // small relative to the periodic pattern.
   for (let n = range.nMin; n <= range.nMax; n += 1) {
@@ -408,26 +432,25 @@ export function hitTest(
       for (let coset = spec.cosets(w, h).length - 1; coset >= 0; coset -= 1) {
         for (let objectIndex = project.objects.length - 1; objectIndex >= 0; objectIndex -= 1) {
           const item = project.objects[objectIndex]!;
+          const canonical = canonicalInstanceKey(cosetIndices.get(item.id)!, coset, n, m);
+          if (reported.has(`${item.id}@${canonical.key}`)) continue;
           const matrix = instanceMatrix(project, coset, n, m);
           const inverse = invert(matrix);
           const [px, py] = transformPoint(inverse, worldX, worldY);
           const sourcePath = makePath2D(item.path);
           const domainPath = makePath2D(makePolygonPath(spec.domain(w, h)));
-          if (!ctx.isPointInPath(domainPath, px, py)) continue;
-          if (item.fill !== 'transparent' && ctx.isPointInPath(sourcePath, px, py)) {
-            return {
-              objectId: item.id,
-              instance: `${item.id}@${coset}:${n},${m}`,
-              matrix,
-              point: [worldX, worldY]
-            };
+          const hitFill = item.fill !== 'transparent' && ctx.isPointInPath(sourcePath, px, py);
+          let hitStroke = false;
+          if (!hitFill) {
+            ctx.lineWidth = Math.max(4, item.strokeWidth + 5);
+            ctx.lineJoin = 'round';
+            hitStroke = ctx.isPointInStroke(sourcePath, px, py);
           }
-          ctx.lineWidth = Math.max(4, item.strokeWidth + 5);
-          ctx.lineJoin = 'round';
-          if (ctx.isPointInStroke(sourcePath, px, py)) {
+          if (ctx.isPointInPath(domainPath, px, py) && (hitFill || hitStroke)) {
+            reported.add(`${item.id}@${canonical.key}`);
             return {
               objectId: item.id,
-              instance: `${item.id}@${coset}:${n},${m}`,
+              instance: `${item.id}@${canonical.coset}:${canonical.n},${canonical.m}`,
               matrix,
               point: [worldX, worldY]
             };

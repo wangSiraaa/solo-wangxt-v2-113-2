@@ -1,7 +1,9 @@
 import type { Project } from '../types';
+import { migrateProject } from './anchors';
 
 const DB_NAME = 'wallpaper-symmetry-editor';
-const DB_VERSION = 1;
+// v2：对象新增 anchors 锚定记录；旧 v1 工程走 migrateProject 原地兼容。
+const DB_VERSION = 2;
 const STORE = 'projects';
 
 function openDb(): Promise<IDBDatabase> {
@@ -39,7 +41,8 @@ export async function loadProject(id: string): Promise<Project | undefined> {
   const db = await openDb();
   try {
     const tx = db.transaction(STORE, 'readonly');
-    return await requestToPromise(tx.objectStore(STORE).get(id));
+    const project = await requestToPromise(tx.objectStore(STORE).get(id));
+    return project ? migrateProject(project) : undefined;
   } finally {
     db.close();
   }
@@ -50,7 +53,7 @@ export async function listProjects(): Promise<Project[]> {
   try {
     const tx = db.transaction(STORE, 'readonly');
     const projects = await requestToPromise(tx.objectStore(STORE).getAll());
-    return projects.sort((a, b) => b.updatedAt - a.updatedAt);
+    return projects.map(migrateProject).sort((a, b) => b.updatedAt - a.updatedAt);
   } finally {
     db.close();
   }

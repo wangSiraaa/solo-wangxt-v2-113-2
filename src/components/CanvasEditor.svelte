@@ -1,9 +1,18 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { mat3 } from 'gl-matrix';
-  import { addObject, editor, pushHistory, renderOptions, selectObject, updateObjectGeometry } from '../lib/stores';
+  import {
+    addAnchor,
+    addObject,
+    cancelAnchorPick,
+    commitConstrainedGeometry,
+    editor,
+    pushHistory,
+    renderOptions,
+    selectObject
+  } from '../lib/stores';
   import { locateRequest } from '../lib/ui';
-  import type { Camera, PathSegment, PatternObject, Point } from '../types';
+  import type { Camera, PathSegment, PatternObject, Point, Project } from '../types';
   import { drawScene, hitTest, screenToWorld } from '../lib/render';
   import {
     applyMatrixToPath,
@@ -15,6 +24,13 @@
     uid
   } from '../lib/path';
   import { GROUP_SPECS, compose, getCellSize, invert, translation } from '../lib/groups';
+  import {
+    anchorReferencePoint,
+    elementsAround,
+    makeAnchor,
+    nearestElement,
+    type ResolvedElement
+  } from '../lib/anchors';
 
   let container: HTMLDivElement;
   let canvas: HTMLCanvasElement;
@@ -80,16 +96,23 @@
       ctx.save();
       ctx.setTransform(dpr * camera.zoom, 0, 0, dpr * camera.zoom, dpr * camera.x, dpr * camera.y);
       const points = editablePoints(selected.path);
+      const anchoredKeys = new Set((selected.anchors ?? []).map((anchor) => `${anchor.pointSegment}:${anchor.pointRole}`));
       for (const point of points) {
         ctx.beginPath();
+        const anchored = anchoredKeys.has(`${point.segmentIndex}:${point.role}`);
         ctx.arc(point.x, point.y, (point.role === 'end' ? 5 : 3.4) / camera.zoom, 0, Math.PI * 2);
-        ctx.fillStyle = point.role === 'end' ? '#ffffff' : '#fed7aa';
-        ctx.strokeStyle = '#ea580c';
+        ctx.fillStyle = anchored ? '#fde68a' : point.role === 'end' ? '#ffffff' : '#fed7aa';
+        ctx.strokeStyle = anchored ? '#b45309' : '#ea580c';
         ctx.lineWidth = 1.5 / camera.zoom;
         ctx.fill();
         ctx.stroke();
       }
+      drawAnchorHighlights(ctx, selected, current.project);
       ctx.restore();
+    }
+
+    if ($editor.anchorPickPending) {
+      drawPickOverlay(ctx, currentWorld);
     }
 
     if (drawing || shapeStart) {
@@ -131,6 +154,86 @@
     if (drawing || shapeStart) ctx.restore();
   }
 
+  function drawElementMarker(ctx: CanvasRenderingContext2D, element: ResolvedElement, color: string, width = 2.5) {
+    const length = 24 / camera.zoom;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = width / camera.zoom;
+    ctx.setLineDash(element.kind === 'glide' ? [7 / camera.zoom, 5 / camera.zoom] : []);
+    if (element.axisDir === null) {
+      ctx.beginPath();
+      ctx.arc(element.point[0], element.point[1], 7 / camera.zoom, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(element.point[0], element.point[1], 2.4 / camera.zoom, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(element.point[0] - element.axisDir[0] * length, element.point[1] - element.axisDir[1] * length);
+      ctx.lineTo(element.point[0] + element.axisDir[0] * length, element.point[1] + element.axisDir[1] * length);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawAnchorHighlights(ctx: CanvasRenderingContext2D, object: PatternObject, project: Project) {
+    for (const anchor of object.anchors ?? []) {
+      const ref = anchorReferencePoint(object, anchor);
+      if (!ref) continue;
+      if (anchor.status === 'broken') {
+        // 待修复锚定：红色虚线连接参考点与失效位置快照。
+        ctx.save();
+        ctx.strokeStyle = '#dc2626';
+        ctx.lineWidth = 1.5 / camera.zoom;
+        ctx.setLineDash([4 / camera.zoom, 4 / camera.zoom]);
+        ctx.beginPath();
+        ctx.moveTo(ref.x, ref.y);
+        ctx.lineTo(anchor.pointX, anchor.pointY);
+        ctx.stroke();
+        ctx.restore();
+        continue;
+      }
+      // 活动锚定：沿轨道找到离参考点最近的那一个元素实例并高亮。
+      const hit = nearestElement(project, [ref.x, ref.y], 12 / camera.zoom);
+      if (hit && hit.key === anchor.elementKey) {
+        drawElementMarker(ctx, hit, '#f59e0b', 3);
+      }
+    }
+  }
+
+  function drawPickOverlay(ctx: CanvasRenderingContext2D, world: Point) {
+    const project = $editor.project;
+    const object = project.objects.find((item) => item.id === $editor.selectedId);
+    if (!object) return;
+    ctx.save();
+    ctx.setTransform(dpr * camera.zoom, 0, 0, dpr * camera.zoom, dpr * camera.x, dpr * camera.y);
+    const threshold = 12 / camera.zoom;
+    // 可参考的可编辑点用空心方框提示。
+    for (const point of editablePoints(object.path)) {
+      ctx.strokeStyle = 'rgba(180,83,9,0.9)';
+      ctx.lineWidth = 1.5 / camera.zoom;
+      ctx.beginPath();
+      const s = 5 / camera.zoom;
+      ctx.rect(point.x - s, point.y - s, s * 2, s * 2);
+      ctx.stroke();
+    }
+    // 吸附到最近对称元素：给出绿色高亮和吸附圆环。
+    const snapped = nearestElement(project, world, threshold);
+    for (const element of elementsAround(project, world, 1)) {
+      const isSnap = snapped === element;
+      drawElementMarker(ctx, element, isSnap ? '#16a34a' : 'rgba(22,163,74,0.55)', isSnap ? 3 : 1.5);
+    }
+    if (snapped) {
+      ctx.beginPath();
+      ctx.arc(world[0], world[1], 9 / camera.zoom, 0, Math.PI * 2);
+      ctx.strokeStyle = '#16a34a';
+      ctx.lineWidth = 1.5 / camera.zoom;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   function resize() {
     const rect = container.getBoundingClientRect();
     width = Math.max(100, rect.width);
@@ -166,6 +269,29 @@
 
     if (event.button === 1 || event.altKey || ($editor.tool === 'select' && event.shiftKey)) {
       panStart = { x, y, cameraX: camera.x, cameraY: camera.y };
+      return;
+    }
+
+    // 锚定拾取：点击位置同时决定参考点（对象自身可编辑点）与对称元素（吸附阈值内）。
+    if ($editor.anchorPickPending) {
+      const project = $editor.project;
+      const object = project.objects.find((item) => item.id === $editor.selectedId);
+      const threshold = 12 / camera.zoom;
+      const reference = object
+        ? (editablePoints(object.path)
+            .map((candidate) => ({
+              candidate,
+              distance: Math.hypot(candidate.x - world[0], candidate.y - world[1])
+            }))
+            .sort((a, b) => a.distance - b.distance)[0]?.candidate ?? null)
+        : null;
+      const element = object ? nearestElement(project, world, threshold) : null;
+      if (object && reference && element) {
+        addAnchor(object.id, makeAnchor(object, reference, element));
+      } else {
+        cancelAnchorPick();
+      }
+      requestDraw();
       return;
     }
 
@@ -245,7 +371,8 @@
         ? compose(invert(drag.matrix), translation(dx, dy))
         : translation(dx, dy);
       const nextPath = applyMatrixToPath(drag.original.path, sourceDelta);
-      updateObjectGeometry(drag.objectId, nextPath, false);
+      // 任意矩阵实例的拖动先映射回唯一源对象，再投影到源对象的锚定约束。
+      commitConstrainedGeometry(drag.objectId, nextPath, false);
       requestDraw();
       return;
     }
@@ -267,7 +394,9 @@
       const points = editablePoints(drag.original.path);
       const target = points[drag.nodeIndex];
       if (target) {
-        updateObjectGeometry(drag.objectId, setEditablePoint(drag.original.path, target, currentWorld[0], currentWorld[1]), false);
+        const candidatePath = setEditablePoint(drag.original.path, target, currentWorld[0], currentWorld[1]);
+        // 节点编辑同样服从锚定：参考点被拖离中心/轴时整体投影回去。
+        commitConstrainedGeometry(drag.objectId, candidatePath, false);
         requestDraw();
       }
     }
@@ -343,6 +472,13 @@
     requestDraw();
   }
 
+  function onKeyDown(event: KeyboardEvent) {
+    if (event.key === 'Escape' && $editor.anchorPickPending) {
+      cancelAnchorPick();
+      requestDraw();
+    }
+  }
+
   editor.subscribe(requestDraw);
   renderOptions.subscribe(requestDraw);
   const unsubscribeLocate = locateRequest.subscribe(locateOriginal);
@@ -352,12 +488,14 @@
     resizeObserver = new ResizeObserver(resize);
     resizeObserver.observe(container);
     resize();
+    window.addEventListener('keydown', onKeyDown);
   });
 
   onDestroy(() => {
     resizeObserver?.disconnect();
     cancelAnimationFrame(frame);
     unsubscribeLocate();
+    window.removeEventListener('keydown', onKeyDown);
   });
 </script>
 
@@ -370,10 +508,14 @@
     on:pointercancel={onPointerUp}
     on:dblclick={onDoubleClick}
     on:wheel|preventDefault={onWheel}
-    class:crosshair={$editor.tool !== 'select'}
+    class:crosshair={$editor.tool !== 'select' || $editor.anchorPickPending}
   />
   <div class="hint">
-    左键操作；Shift/Alt/中键拖动画布；滚轮缩放；双击任意实例定位原始基本单元
+    {#if $editor.anchorPickPending}
+      锚定拾取：点击参考点附近的旋转中心 / 镜线 / 滑移轴（绿色高亮为吸附目标）；Esc 取消
+    {:else}
+      左键操作；Shift/Alt/中键拖动画布；滚轮缩放；双击任意实例定位原始基本单元
+    {/if}
   </div>
 </div>
 

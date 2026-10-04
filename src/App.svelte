@@ -17,11 +17,18 @@
   } from './lib/stores';
   import { deleteProject, listProjects, saveProject } from './lib/db';
   import { defaultProject, glideSample, p6mSample, rotationSample } from './lib/samples';
+  import { brokenAnchors } from './lib/anchors';
+  import { removeAnchor, repairAnchorById } from './lib/stores';
   import type { Project, Tool } from './types';
 
   let savedProjects: Project[] = [];
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let activeTab: 'group' | 'inspector' | 'seam' | 'projects' = 'group';
+
+  $: brokenList = brokenAnchors($editor.project);
+  $: brokenSummary = brokenList
+    .map(({ object, anchor }) => `${object.name} → ${anchor.brokenReason}`)
+    .join('；');
 
   const tools: Array<{ id: Tool; label: string; title: string }> = [
     { id: 'select', label: '选择/拖动', title: '选择实例并拖动；拖动映射回原始路径' },
@@ -134,6 +141,20 @@
     <label class="toggle"><input type="checkbox" bind:checked={$renderOptions.showSymmetry} />对称元素</label>
   </section>
 
+  {#if brokenList.length > 0}
+    <div class="repair-banner">
+      <span>⚠ {brokenList.length} 个对称锚定待修复：{brokenSummary}</span>
+      <div>
+        <button on:click={() => brokenList.forEach(({ anchor }) => repairAnchorById(anchor.id))}>
+          全部重新匹配
+        </button>
+        <button class="danger" on:click={() => brokenList.forEach(({ anchor }) => removeAnchor(anchor.id))}>
+          全部解除
+        </button>
+        <button on:click={() => (activeTab = 'inspector')}>到对象面板处理</button>
+      </div>
+    </div>
+  {/if}
   <section class="workspace">
     <aside class="left">
       <nav>
@@ -286,6 +307,22 @@
     min-height: 0;
     display: grid;
     grid-template-columns: 320px minmax(0, 1fr) 240px;
+  }
+  .repair-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 7px 14px;
+    background: #fef2f2;
+    border-bottom: 1px solid #fecaca;
+    color: #991b1b;
+    font-size: 12px;
+  }
+  .repair-banner div {
+    display: flex;
+    gap: 6px;
   }
   .left,
   .right {
