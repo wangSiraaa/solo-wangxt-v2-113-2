@@ -1,7 +1,8 @@
+import type { mat3 } from 'gl-matrix';
 import type { Project } from '../types';
-import { GROUP_SPECS, getCellSize, translationMatrix } from './groups';
-import { applyMat3, instanceMatrix } from './render';
-import { makePath2D, makePolygonPath, tracePath } from './path';
+import { GROUP_SPECS, compose, getCellSize, translationMatrix } from './groups';
+import { applyMat3, coincidenceGroups } from './render';
+import { makePath2D, makePolygonPath } from './path';
 
 export interface TileResult {
   canvas: HTMLCanvasElement;
@@ -13,9 +14,11 @@ export interface TileResult {
 
 /**
  * Render a true periodic image. Rectangular groups use one conventional cell.
- * Triangular groups export a rectangular supercell formed by 2×2 primitive vectors,
- * which still repeats under the wallpaper group's translation lattice. Fundamental
- * domains are clipped as matrix images, including on transparent pixels.
+ * Triangular groups export a rectangular supercell formed by 2×2 primitive
+ * vectors, which still repeats under the wallpaper group's translation lattice.
+ * Each DISTINCT orbit image is painted once: stabilizer coincidences are
+ * de-duplicated with the same geometry grouping as the on-screen renderer, so a
+ * motif on a rotation centre is never stacked darker in the exported PNG.
  */
 export function exportPeriodicTile(project: Project, scale = 2): TileResult {
   const [cellW, cellH] = getCellSize(project.group, project.cellWidth, project.cellHeight);
@@ -38,48 +41,45 @@ export function exportPeriodicTile(project: Project, scale = 2): TileResult {
   // Keep the exported tile transparent: deliberately do not paint a background.
   ctx.clearRect(0, 0, width, height);
 
-  const cosetMatrices = spec.cosets(cellW, cellH);
   const domainPath = makePath2D(makePolygonPath(spec.domain(cellW, cellH)));
 
-  // A few extra neighboring primitive copies are needed only because some fundamental
-  // domain coordinates (pm/pmg/cm) extend across the conventional rectangle's border.
+  // A few extra neighboring primitive copies are needed only because some
+  // fundamental domain coordinates (pm/pmg/cm) cross the rectangle's border.
   const range = triangular
-    ? { nMin: -1, nMax: 2, mMin: -1, mMax: 2 }
-    : { nMin: -1, nMax: 1, mMin: -1, mMax: 1 };
+    ? { nMin: -2, nMax: 3, mMin: -2, mMax: 3 }
+    : { nMin: -2, nMax: 2, mMin: -2, mMax: 2 };
+
+  const shift: mat3 = triangular ? translationMatrix(project.group, cellW, cellH, 1, 1) : null!;
 
   for (const item of project.objects) {
     const path = makePath2D(item.path);
-    for (let coset = 0; coset < cosetMatrices.length; coset += 1) {
-      for (let n = range.nMin; n <= range.nMax; n += 1) {
-        for (let m = range.mMin; m <= range.mMax; m += 1) {
-          ctx.save();
-          // Translate into the positive rectangular supercell before clipping.
-          const shift = translationMatrix(project.group, cellW, cellH, triangular ? 1 : 0, triangular ? 1 : 0);
-          const matrix = shift;
-          void matrix;
-          applyMat3(ctx, instanceMatrix(project, coset, n + (triangular ? 1 : 0), m + (triangular ? 1 : 0)));
-          ctx.beginPath();
-          ctx.rect(0, 0, width, height);
-          ctx.clip();
-          ctx.clip(domainPath);
-          ctx.globalAlpha = item.opacity;
-          if (item.fill !== 'transparent') {
-            ctx.fillStyle = item.fill;
-            ctx.fill(path);
-          }
-          if (item.strokeWidth > 0) {
-            ctx.strokeStyle = item.stroke;
-            ctx.lineWidth = item.strokeWidth;
-            ctx.lineJoin = 'round';
-            ctx.lineCap = 'round';
-            ctx.stroke(path);
-          }
-          ctx.restore();
-        }
+    const groups = coincidenceGroups(project, item, range);
+    for (const group of groups) {
+      const representative = group.members[0]!;
+      const matrix = triangular ? compose(shift, representative.matrix) : representative.matrix;
+      ctx.save();
+      applyMat3(ctx, matrix);
+      ctx.beginPath();
+      ctx.rect(-cellW, -cellH, width + cellW * 2, height + cellH * 2);
+      ctx.clip();
+      // A stabilizer coincidence paints the full motif once, without domain
+      // clipping, so the exported tile has no dark double-stack at the centre.
+      if (!group.coincident) ctx.clip(domainPath);
+      ctx.globalAlpha = item.opacity;
+      if (item.fill !== 'transparent') {
+        ctx.fillStyle = item.fill;
+        ctx.fill(path);
       }
+      if (item.strokeWidth > 0) {
+        ctx.strokeStyle = item.stroke;
+        ctx.lineWidth = item.strokeWidth;
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        ctx.stroke(path);
+      }
+      ctx.restore();
     }
   }
-  void tracePath;
   return {
     canvas,
     width,

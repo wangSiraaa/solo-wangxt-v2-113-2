@@ -7,6 +7,9 @@
     "dev": "vite --host 0.0.0.0",
     "build": "svelte-check --tsconfig ./tsconfig.json && vite build",
     "test:groups": "tsx scripts/check-tiling.ts",
+    "test:anchors": "tsx scripts/check-anchors.ts",
+    "test:store": "tsx scripts/check-store.ts",
+    "test": "tsx scripts/check-tiling.ts && tsx scripts/check-anchors.ts && tsx scripts/check-store.ts",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {

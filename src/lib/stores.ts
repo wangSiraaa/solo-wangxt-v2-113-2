@@ -1,9 +1,24 @@
 import { get, writable } from 'svelte/store';
-import type { GroupId, PatternObject, Project, RenderOptions, Tool } from '../types';
+import type {
+  AnchorOffsetRule,
+  AnchorRefKind,
+  GroupId,
+  PatternObject,
+  Project,
+  RenderOptions,
+  SymmetryAnchor,
+  Tool
+} from '../types';
 import { defaultProject } from './samples';
-import { cloneObject, applyMatrixToPath } from './path';
-import { getCellSize, GROUP_SPECS, translation } from './groups';
-import type { mat3 } from 'gl-matrix';
+import { cloneObject } from './path';
+import {
+  createAnchor as buildAnchor,
+  migrateProject,
+  reconcileAnchors,
+  removeAnchor as removeAnchorRecord,
+  repairAnchor as repairAnchorRecord,
+  snapProjectAnchors
+} from './anchors';
 
 export interface EditorState {
   project: Project;
@@ -22,7 +37,7 @@ interface HistoryEntry {
   selectedInstance: string | null;
 }
 
-const initialProject = defaultProject();
+const initialProject = migrateProject(defaultProject());
 const editorStore = writable<EditorState>({
   project: initialProject,
   selectedId: initialProject.objects[0]?.id ?? null,
@@ -95,13 +110,16 @@ export function updateProject(mutator: (project: Project) => Project, record = t
 }
 
 export function setProject(project: Project, clearHistory = true) {
+  // Every project entering the editor — from disk, samples, or a reload — passes
+  // through migration so old v1 projects and broken anchors behave consistently.
+  const migrated = migrateProject(structuredClone(project));
   if (clearHistory) {
     undoStack.length = 0;
     redoStack.length = 0;
   }
   editorStore.set({
-    project: structuredClone(project),
-    selectedId: project.objects[0]?.id ?? null,
+    project: migrated,
+    selectedId: migrated.objects[0]?.id ?? null,
     selectedInstance: null,
     tool: 'select',
     canUndo: false,
@@ -132,17 +150,26 @@ export function setGroup(group: GroupId) {
       : triangular
         ? Math.round((Math.sqrt(3) / 2) * project.cellWidth)
         : project.cellHeight;
-    return { ...project, group, cellHeight };
+    // Anchors are never dropped on a group change: they are re-mapped to the new
+    // group or enter the broken (needs-repair) state with an explicit reason.
+    const next = reconcileAnchors({ ...project, group, cellHeight });
+    // Active anchors in the new group keep the motif pinned to its element.
+    return snapProjectAnchors(next);
   });
   editorStore.update((state) => ({ ...state, selectedInstance: null }));
 }
 
 export function setCellSize(width: number, height: number) {
-  updateProject((project) => ({
-    ...project,
-    cellWidth: Math.max(40, Math.round(width)),
-    cellHeight: Math.max(40, Math.round(height))
-  }));
+  updateProject((project) => {
+    const next: Project = {
+      ...project,
+      cellWidth: Math.max(40, Math.round(width)),
+      cellHeight: Math.max(40, Math.round(height))
+    };
+    // Named elements are defined in lattice fractions, so they track the new
+    // cell automatically; re-snapping keeps the reference point coincident.
+    return snapProjectAnchors(reconcileAnchors(next));
+  });
 }
 
 export function addObject(item: PatternObject, select = true) {
@@ -170,15 +197,57 @@ export function updateObjectGeometry(id: string, path: PatternObject['path'], re
 }
 
 export function deleteSelected() {
-  updateProject((project) => ({
-    ...project,
-    objects: project.objects.filter((item) => item.id !== get(editorStore).selectedId)
-  }));
+  const selectedId = get(editorStore).selectedId;
+  updateProject((project) => {
+    const objects = project.objects.filter((item) => item.id !== selectedId);
+    // Keep the anchor record (and its undo identity) but flag it as needing
+    // repair; undo restores the object and the anchor automatically re-activates.
+    const anchors = (project.anchors ?? []).map((anchor) =>
+      anchor.objectId === selectedId
+        ? { ...anchor, status: 'broken' as const, brokenReason: '原始对象已删除' }
+        : anchor
+    );
+    return { ...project, objects, anchors };
+  });
   editorStore.update((state) => ({ ...state, selectedId: null, selectedInstance: null }));
 }
 
 export function markSaved() {
   editorStore.update((state) => ({ ...state, saved: true }));
+}
+
+/* ------------------------------------------------------------------ */
+/* Anchor commands                                                    */
+/* ------------------------------------------------------------------ */
+
+export function anchorSelected(input: {
+  elementId: string;
+  ref: AnchorRefKind;
+  rule: AnchorOffsetRule;
+  offset?: number;
+}) {
+  const state = get(editorStore);
+  if (!state.selectedId) return;
+  updateProject((project) => {
+    const result = buildAnchor({ ...input, objectId: state.selectedId!, project });
+    return result.project;
+  });
+}
+
+export function detachAnchor(anchorId: string) {
+  updateProject((project) => removeAnchorRecord(anchorId, project));
+}
+
+export function fixAnchor(anchorId: string, elementId: string, rule: AnchorOffsetRule, offset: number) {
+  updateProject((project) => snapProjectAnchors(repairAnchorRecord(anchorId, elementId, rule, offset, project)));
+}
+
+export function activeAnchorFor(project: Project, objectId: string): SymmetryAnchor | undefined {
+  return project.anchors?.find((anchor) => anchor.status === 'active' && anchor.objectId === objectId);
+}
+
+export function hasBrokenAnchors(project: Project): boolean {
+  return (project.anchors ?? []).some((anchor) => anchor.status === 'broken');
 }
 
 export const renderOptions = writable<RenderOptions>({

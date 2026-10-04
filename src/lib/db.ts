@@ -1,7 +1,9 @@
 import type { Project } from '../types';
+import { migrateProject } from './anchors';
 
 const DB_NAME = 'wallpaper-symmetry-editor';
-const DB_VERSION = 1;
+// v2 adds per-object symmetry anchors; v1 records are migrated on read.
+const DB_VERSION = 2;
 const STORE = 'projects';
 
 function openDb(): Promise<IDBDatabase> {
@@ -39,7 +41,8 @@ export async function loadProject(id: string): Promise<Project | undefined> {
   const db = await openDb();
   try {
     const tx = db.transaction(STORE, 'readonly');
-    return await requestToPromise(tx.objectStore(STORE).get(id));
+    const raw = await requestToPromise<Project | undefined>(tx.objectStore(STORE).get(id) as IDBRequest<Project | undefined>);
+    return raw ? migrateProject(raw) : undefined;
   } finally {
     db.close();
   }
@@ -49,8 +52,8 @@ export async function listProjects(): Promise<Project[]> {
   const db = await openDb();
   try {
     const tx = db.transaction(STORE, 'readonly');
-    const projects = await requestToPromise(tx.objectStore(STORE).getAll());
-    return projects.sort((a, b) => b.updatedAt - a.updatedAt);
+    const raw = await requestToPromise<Project[]>(tx.objectStore(STORE).getAll() as IDBRequest<Project[]>);
+    return raw.map(migrateProject).sort((a, b) => b.updatedAt - a.updatedAt);
   } finally {
     db.close();
   }

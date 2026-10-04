@@ -12,6 +12,7 @@ import {
   translationMatrix
 } from './groups';
 import { makePath2D, makePolygonPath, tracePath } from './path';
+import { resolveElement } from './anchors';
 
 export interface InstanceKey {
   objectId: string;
@@ -37,6 +38,77 @@ export function instanceMatrix(project: Project, coset: number, n: number, m: nu
   const [w, h] = getCellSize(project.group, project.cellWidth, project.cellHeight);
   const spec = GROUP_SPECS[project.group];
   return compose(translationMatrix(project.group, w, h, n, m), spec.cosets(w, h)[coset]!);
+}
+
+/**
+ * Canonical fingerprint of one rendered path image. A stabilizer coincidence
+ * happens when two (coset,n,m) images of the SAME source path occupy identical
+ * geometry (e.g. a circle or square pinned on a 4-fold centre is unchanged by
+ * the stabilizer rotations/reflections). Comparing the quantized MULTISET of
+ * all path coordinates — rather than the matrix — detects exactly those
+ * setwise-identical images: permuted symmetry anchors hash together, while
+ * genuinely rotated shapes at the centre hash apart and are kept.
+ */
+export function imageKey(project: Project, path: PatternObject['path'], matrix: mat3): string {
+  void project;
+  const coords: number[] = [];
+  for (const segment of path) {
+    if (segment.type === 'M' || segment.type === 'L') {
+      coords.push(...transformPoint(matrix, segment.x, segment.y));
+    } else if (segment.type === 'Q') {
+      coords.push(...transformPoint(matrix, segment.x, segment.y));
+      coords.push(...transformPoint(matrix, segment.cx, segment.cy));
+    } else if (segment.type === 'C') {
+      coords.push(...transformPoint(matrix, segment.x, segment.y));
+      coords.push(...transformPoint(matrix, segment.cx1, segment.cy1));
+      coords.push(...transformPoint(matrix, segment.cx2, segment.cy2));
+    }
+  }
+  const quant = (v: number) => {
+    const rounded = Math.round(v * 1000) / 1000;
+    return Object.is(rounded, -0) ? 0 : rounded;
+  };
+  const pairs = new Set<string>();
+  for (let i = 0; i < coords.length; i += 2) {
+    pairs.add(`${quant(coords[i]!)},${quant(coords[i + 1]!)}`);
+  }
+  return [...pairs].sort().join(';');
+}
+
+/**
+ * Group orbit images of one object by rendered-geometry coincidence. Each
+ * returned group paints one distinct on-screen shape. A group with more than
+ * one member is a stabilizer coincidence: its members overlap pixel-for-pixel
+ * and must be drawn (and hit-tested) exactly once.
+ */
+export interface CoincidenceGroup {
+  key: string;
+  members: InstanceKey[];
+  coincident: boolean;
+}
+
+export function coincidenceGroups(
+  project: Project,
+  item: PatternObject,
+  range: ReturnType<typeof translationRange>
+): CoincidenceGroup[] {
+  const [w, h] = getCellSize(project.group, project.cellWidth, project.cellHeight);
+  const cosetCount = GROUP_SPECS[project.group].cosets(w, h).length;
+  const groups = new Map<string, CoincidenceGroup>();
+  for (let coset = 0; coset < cosetCount; coset += 1) {
+    for (let n = range.nMin; n <= range.nMax; n += 1) {
+      for (let m = range.mMin; m <= range.mMax; m += 1) {
+        const matrix = instanceMatrix(project, coset, n, m);
+        const key = imageKey(project, item.path, matrix);
+        const key0: InstanceKey = { objectId: item.id, coset, n, m, matrix };
+        const group = groups.get(key);
+        if (group) group.members.push(key0);
+        else groups.set(key, { key, members: [key0], coincident: false });
+      }
+    }
+  }
+  for (const group of groups.values()) group.coincident = group.members.length > 1;
+  return [...groups.values()];
 }
 
 /**
@@ -105,6 +177,19 @@ export function translationRange(
     mMin: Math.floor(mMin) - margin,
     mMax: Math.ceil(mMax) + margin
   };
+}
+
+/**
+ * Enumerate one representative per distinct orbit image for a single object.
+ * Stabilizer coincidences collapse to a single representative so callers paint
+ * each geometric image once.
+ */
+export function canonicalImages(
+  project: Project,
+  item: PatternObject,
+  range: ReturnType<typeof translationRange>
+): CoincidenceGroup[] {
+  return coincidenceGroups(project, item, range);
 }
 
 function paintObject(ctx: CanvasRenderingContext2D, item: PatternObject, selected: boolean) {
@@ -362,19 +447,22 @@ export function drawScene(
 
   for (const item of project.objects) {
     const itemPath = makePath2D(item.path);
-    for (let coset = 0; coset < spec.cosets(w, h).length; coset += 1) {
-      for (let n = range.nMin; n <= range.nMax; n += 1) {
-        for (let m = range.mMin; m <= range.mMax; m += 1) {
-          const matrix = instanceMatrix(project, coset, n, m);
-          ctx.save();
-          applyMat3(ctx, matrix);
-          ctx.clip(domainPath);
-          paintObject(ctx, item, item.id === selectedId);
-          ctx.restore();
-        }
-      }
+    // De-duplicated orbit enumeration. A stabilizer coincidence (e.g. a
+    // rotationally symmetric motif on a 4-fold centre) paints the full motif
+    // exactly once WITHOUT domain clipping, so overlapping stabilizer images
+    // are never stacked into a darker colour.
+    const groups = canonicalImages(project, item, range);
+    for (const group of groups) {
+      const representative = group.members[0]!;
+      ctx.save();
+      applyMat3(ctx, representative.matrix);
+      if (!group.coincident) ctx.clip(domainPath);
+      paintObject(ctx, item, item.id === selectedId);
+      ctx.restore();
     }
   }
+
+  drawAnchorMarkers(ctx, project, range, selectedId);
 
   if (options.showDomain) {
     for (let n = range.nMin; n <= range.nMax; n += 1) {
@@ -386,6 +474,55 @@ export function drawScene(
       }
     }
   }
+}
+
+function drawAnchorMarkers(
+  ctx: CanvasRenderingContext2D,
+  project: Project,
+  range: ReturnType<typeof translationRange>,
+  selectedId: string | null
+) {
+  const anchors = project.anchors ?? [];
+  if (anchors.length === 0) return;
+  const [w, h] = getCellSize(project.group, project.cellWidth, project.cellHeight);
+  const [[ax, ay], [bx, by]] = latticeVectors(project.group, w, h);
+  ctx.save();
+  const unit = 1 / ctx.getTransform().a;
+  for (const anchor of anchors) {
+    if (anchor.status !== 'active') continue;
+    const element = resolveElement(project.group, anchor.elementId, w, h);
+    if (!element) continue;
+    const isSelected = anchor.objectId === selectedId;
+    const color = isSelected ? '#f97316' : 'rgba(5,150,105,0.9)';
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = (isSelected ? 2.4 : 1.6) * unit;
+    ctx.setLineDash([6 * unit, 4 * unit]);
+    for (let n = range.nMin; n <= range.nMax; n += 1) {
+      for (let m = range.mMin; m <= range.mMax; m += 1) {
+        const ox = n * ax + m * bx;
+        const oy = n * ay + m * by;
+        if (element.point) {
+          const r = 7 * unit;
+          ctx.beginPath();
+          ctx.moveTo(ox + element.point[0] - r, oy + element.point[1]);
+          ctx.lineTo(ox + element.point[0] + r, oy + element.point[1]);
+          ctx.moveTo(ox + element.point[0], oy + element.point[1] - r);
+          ctx.lineTo(ox + element.point[0], oy + element.point[1] + r);
+          ctx.stroke();
+        } else if (element.axis) {
+          const length = Math.max(w, h) * 2.2;
+          const [dx, dy] = element.axis.direction;
+          ctx.beginPath();
+          ctx.moveTo(ox + element.axis.point[0] - dx * length, oy + element.axis.point[1] - dy * length);
+          ctx.lineTo(ox + element.axis.point[0] + dx * length, oy + element.axis.point[1] + dy * length);
+          ctx.stroke();
+        }
+      }
+    }
+    ctx.setLineDash([]);
+  }
+  ctx.restore();
 }
 
 export function hitTest(
@@ -401,38 +538,39 @@ export function hitTest(
   const range = translationRange(project, camera, width, height, 1);
   const [w, h] = getCellSize(project.group, project.cellWidth, project.cellHeight);
   const spec = GROUP_SPECS[project.group];
-  // The editor tests a deliberately generous band because interactive canvases are usually
-  // small relative to the periodic pattern.
-  for (let n = range.nMin; n <= range.nMax; n += 1) {
-    for (let m = range.mMin; m <= range.mMax; m += 1) {
-      for (let coset = spec.cosets(w, h).length - 1; coset >= 0; coset -= 1) {
-        for (let objectIndex = project.objects.length - 1; objectIndex >= 0; objectIndex -= 1) {
-          const item = project.objects[objectIndex]!;
-          const matrix = instanceMatrix(project, coset, n, m);
-          const inverse = invert(matrix);
-          const [px, py] = transformPoint(inverse, worldX, worldY);
-          const sourcePath = makePath2D(item.path);
-          const domainPath = makePath2D(makePolygonPath(spec.domain(w, h)));
-          if (!ctx.isPointInPath(domainPath, px, py)) continue;
-          if (item.fill !== 'transparent' && ctx.isPointInPath(sourcePath, px, py)) {
-            return {
-              objectId: item.id,
-              instance: `${item.id}@${coset}:${n},${m}`,
-              matrix,
-              point: [worldX, worldY]
-            };
-          }
-          ctx.lineWidth = Math.max(4, item.strokeWidth + 5);
-          ctx.lineJoin = 'round';
-          if (ctx.isPointInStroke(sourcePath, px, py)) {
-            return {
-              objectId: item.id,
-              instance: `${item.id}@${coset}:${n},${m}`,
-              matrix,
-              point: [worldX, worldY]
-            };
-          }
-        }
+  // Test objects back-to-front (latest drawn is picked first). Each object's
+  // orbit is reduced to distinct geometry groups, so a stabilizer coincidence at
+  // a rotation centre yields ONE click identity instead of N ambiguous hits.
+  for (let objectIndex = project.objects.length - 1; objectIndex >= 0; objectIndex -= 1) {
+    const item = project.objects[objectIndex]!;
+    const groups = coincidenceGroups(project, item, range);
+    for (const group of groups) {
+      const representative = group.members[0]!;
+      const { coset, n, m, matrix } = representative;
+      const [px, py] = transformPoint(invert(matrix), worldX, worldY);
+      const sourcePath = makePath2D(item.path);
+      const inside = (): boolean => {
+        if (group.coincident) return true; // geometry-equal images share the clip union
+        const domainPath = makePath2D(makePolygonPath(spec.domain(w, h)));
+        return ctx.isPointInPath(domainPath, px, py);
+      };
+      if (item.fill !== 'transparent' && inside() && ctx.isPointInPath(sourcePath, px, py)) {
+        return {
+          objectId: item.id,
+          instance: `${item.id}@${coset}:${n},${m}`,
+          matrix,
+          point: [worldX, worldY]
+        };
+      }
+      ctx.lineWidth = Math.max(4, item.strokeWidth + 5);
+      ctx.lineJoin = 'round';
+      if (inside() && ctx.isPointInStroke(sourcePath, px, py)) {
+        return {
+          objectId: item.id,
+          instance: `${item.id}@${coset}:${n},${m}`,
+          matrix,
+          point: [worldX, worldY]
+        };
       }
     }
   }

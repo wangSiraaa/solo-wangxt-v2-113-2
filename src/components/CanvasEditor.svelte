@@ -3,7 +3,7 @@
   import { mat3 } from 'gl-matrix';
   import { addObject, editor, pushHistory, renderOptions, selectObject, updateObjectGeometry } from '../lib/stores';
   import { locateRequest } from '../lib/ui';
-  import type { Camera, PathSegment, PatternObject, Point } from '../types';
+  import type { Camera, PathSegment, PatternObject, Point, SymmetryAnchor } from '../types';
   import { drawScene, hitTest, screenToWorld } from '../lib/render';
   import {
     applyMatrixToPath,
@@ -15,6 +15,7 @@
     uid
   } from '../lib/path';
   import { GROUP_SPECS, compose, getCellSize, invert, translation } from '../lib/groups';
+  import { enforceAnchor, projectDragToAnchor } from '../lib/anchors';
 
   let container: HTMLDivElement;
   let canvas: HTMLCanvasElement;
@@ -33,6 +34,7 @@
         original: PatternObject;
         nodeIndex?: number;
         moved?: boolean;
+        anchor?: SymmetryAnchor | null;
       }
     | null = null;
   let drawing: PathSegment[] | null = null;
@@ -178,13 +180,18 @@
         .filter((candidate) => candidate.distance <= threshold)
         .sort((a, b) => a.distance - b.distance)[0];
       if (hit) {
+        const anchor =
+          $editor.project.anchors?.find(
+            (candidate) => candidate.status === 'active' && candidate.objectId === selected.id
+          ) ?? null;
         drag = {
           kind: 'node',
           objectId: selected.id,
           matrix: null,
           startWorld: world,
           original: structuredClone(selected),
-          nodeIndex: hit.nodeIndex
+          nodeIndex: hit.nodeIndex,
+          anchor
         };
         return;
       }
@@ -197,12 +204,17 @@
         hoverInstance = hit.instance;
         const source = $editor.project.objects.find((item) => item.id === hit.objectId);
         if (source && $editor.tool === 'select') {
+          const anchor =
+            $editor.project.anchors?.find(
+              (candidate) => candidate.status === 'active' && candidate.objectId === hit.objectId
+            ) ?? null;
           drag = {
             kind: 'object',
             objectId: hit.objectId,
             matrix: hit.matrix,
             startWorld: world,
-            original: structuredClone(source)
+            original: structuredClone(source),
+            anchor
           };
         }
       } else if ($editor.tool === 'select') {
@@ -239,12 +251,28 @@
       }
       const dx = currentWorld[0] - drag.startWorld[0];
       const dy = currentWorld[1] - drag.startWorld[1];
-      // Dragging a transformed instance maps the movement back through that instance
-      // matrix. Every orbit image then updates because only the source object changes.
-      const sourceDelta: mat3 = drag.matrix
-        ? compose(invert(drag.matrix), translation(dx, dy))
-        : translation(dx, dy);
-      const nextPath = applyMatrixToPath(drag.original.path, sourceDelta);
+      let nextPath: PathSegment[];
+      if (drag.anchor && drag.matrix) {
+        // Dragging ANY matrix instance maps back to the unique source object,
+        // then projects onto its anchor: a pin ignores the drag entirely, an
+        // axis anchor keeps only the motion along the mirror/glide line.
+        nextPath = projectDragToAnchor(
+          drag.original.path,
+          drag.anchor,
+          drag.matrix,
+          dx,
+          dy,
+          $editor.project.cellWidth,
+          $editor.project.cellHeight
+        );
+      } else {
+        // Unanchored objects translate freely; every orbit image updates because
+        // only the source object changes.
+        const sourceDelta = drag.matrix
+          ? compose(invert(drag.matrix), translation(dx, dy))
+          : translation(dx, dy);
+        nextPath = applyMatrixToPath(drag.original.path, sourceDelta);
+      }
       updateObjectGeometry(drag.objectId, nextPath, false);
       requestDraw();
       return;
@@ -267,7 +295,11 @@
       const points = editablePoints(drag.original.path);
       const target = points[drag.nodeIndex];
       if (target) {
-        updateObjectGeometry(drag.objectId, setEditablePoint(drag.original.path, target, currentWorld[0], currentWorld[1]), false);
+        let nextPath = setEditablePoint(drag.original.path, target, currentWorld[0], currentWorld[1]);
+        if (drag.anchor) {
+          nextPath = enforceAnchor(nextPath, drag.anchor, $editor.project.cellWidth, $editor.project.cellHeight);
+        }
+        updateObjectGeometry(drag.objectId, nextPath, false);
         requestDraw();
       }
     }

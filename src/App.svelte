@@ -23,6 +23,8 @@
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let activeTab: 'group' | 'inspector' | 'seam' | 'projects' = 'group';
 
+  $: brokenCount = ($editor.project.anchors ?? []).filter((anchor) => anchor.status === 'broken').length;
+
   const tools: Array<{ id: Tool; label: string; title: string }> = [
     { id: 'select', label: '选择/拖动', title: '选择实例并拖动；拖动映射回原始路径' },
     { id: 'node', label: '节点', title: '编辑原始路径的贝塞尔节点和控制点' },
@@ -134,6 +136,13 @@
     <label class="toggle"><input type="checkbox" bind:checked={$renderOptions.showSymmetry} />对称元素</label>
   </section>
 
+  {#if brokenCount > 0}
+    <div class="anchor-warning">
+      <span>⚠ {brokenCount} 个锚定在当前墙纸群（{$editor.project.group}）中无法重映射，已进入待修复状态，未被静默删除。</span>
+      <button on:click={() => (activeTab = 'inspector')}>前往修复 / 解除（撤销可恢复）</button>
+    </div>
+  {/if}
+
   <section class="workspace">
     <aside class="left">
       <nav>
@@ -179,10 +188,18 @@
       <p class="note">点击列表直接选择唯一原始对象；画布上所有实例共享同一身份 ID。</p>
       <ul class="object-list">
         {#each $editor.project.objects as object (object.id)}
+          {@const objectAnchor = ($editor.project.anchors ?? []).find((a) => a.objectId === object.id)}
           <li class:active={object.id === $editor.selectedId}>
             <button on:click={() => selectObject(object.id, null)}>
               <i style={`background:${object.fill};opacity:${object.opacity}`}></i>
-              <span>{object.name}</span>
+              <span class="obj-name">
+                {object.name}
+                {#if objectAnchor?.status === 'active'}
+                  <em class="anchor-tag active">已锚定 · {objectAnchor.elementLabel}</em>
+                {:else if objectAnchor?.status === 'broken'}
+                  <em class="anchor-tag broken">待修复</em>
+                {/if}
+              </span>
             </button>
           </li>
         {/each}
@@ -282,6 +299,23 @@
     gap: 4px;
     font-size: 12px;
   }
+  .anchor-warning {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 7px 14px;
+    background: #fef3c7;
+    border-bottom: 1px solid #fcd34d;
+    color: #92400e;
+    font-size: 12px;
+  }
+  .anchor-warning button {
+    white-space: nowrap;
+    background: #b45309;
+    color: white;
+    border-color: #b45309;
+  }
   .workspace {
     min-height: 0;
     display: grid;
@@ -362,6 +396,26 @@
     border: 1px solid #0f172a;
     border-radius: 50%;
     display: inline-block;
+  }
+  .obj-name {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .anchor-tag {
+    font-style: normal;
+    font-size: 10px;
+    border-radius: 4px;
+    padding: 1px 5px;
+    width: fit-content;
+  }
+  .anchor-tag.active {
+    background: #d1fae5;
+    color: #065f46;
+  }
+  .anchor-tag.broken {
+    background: #fef3c7;
+    color: #92400e;
   }
   .note {
     color: #64748b;
